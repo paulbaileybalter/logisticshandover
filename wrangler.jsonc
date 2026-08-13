@@ -1,0 +1,15 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "balter-logistics-handover",
+  "main": "src/worker.js",
+  "compatibility_date": "2026-08-01",
+  "assets": {
+    "directory": "./public",
+    "binding": "ASSETS",
+    // Every request — including static files — is routed to the Worker
+    // first, so the password/session check below runs before anything is
+    // served. Without this, Cloudflare would serve public/ files directly
+    // and the Worker would never see those requests.
+    "run_worker_first": true
+  }
+}

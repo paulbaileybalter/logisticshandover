@@ -828,7 +828,7 @@
     html += '</table>';
 
     // AM Priorities
-    html += '<div style="text-align:center;font-family:Arial,Helvetica,sans-serif;font-weight:bold;font-size:16px;color:' + C.ink + ';margin:22px 0 2px;">' + esc(formatBanner(addDays(d.date, 1))) + '</div>';
+    html += '<div style="text-align:left;font-family:Arial,Helvetica,sans-serif;font-weight:bold;font-size:16px;color:' + C.ink + ';margin:22px 0 2px;">' + esc(formatBanner(addDays(d.date, 1))) + '</div>';
     html += sectionTitle("AM Priorities", C.mint);
     html += '<table style="border-collapse:collapse;width:100%;max-width:900px;">';
     d.amPriorities.filter(function (t) { return t && t.trim(); }).forEach(function (t) { html += '<tr>' + td(esc(t)) + '</tr>'; });

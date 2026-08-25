@@ -6,15 +6,15 @@
  * MULTI-DEVICE SYNC
  * ---------------------------------------------------------------
  * Cloud sync now runs through this site's own Cloudflare Worker at
- * /api/sync — the real JSONBin.io Bin ID and API key live ONLY as Worker
- * secrets (Settings → Variables and Secrets → JSONBIN_BIN_ID /
- * JSONBIN_API_KEY in the Cloudflare dashboard). Nothing sensitive belongs
- * in this file anymore; it's shipped to every visitor's browser as plain
- * text, so anything written here is effectively public.
+ * /api/sync — the handover data is stored directly in a Cloudflare KV
+ * namespace bound to the Worker (see wrangler.jsonc / README.md). There's
+ * no external service or API key involved at all anymore. Nothing
+ * sensitive belongs in this file; it's shipped to every visitor's browser
+ * as plain text, so anything written here is effectively public.
  *
  * The site figures out on its own whether sync is turned on (by asking
- * the Worker), so there's nothing to flip here — just set the two secrets
- * in Cloudflare and it starts working. See README.md for the full setup.
+ * the Worker), so there's nothing to flip here — just bind the KV
+ * namespace in Cloudflare and it starts working. See README.md.
  */
 window.HANDOVER_CONFIG = {
   cloudSync: {

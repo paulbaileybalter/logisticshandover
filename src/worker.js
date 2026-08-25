@@ -8,9 +8,10 @@
  *   2. Everything else requires a valid signed session cookie. No cookie,
  *      an expired one, or a tampered one → redirected to /login (or, for
  *      /api/* calls, a 401 JSON response).
- *   3. /api/sync is a server-side proxy to JSONBin.io — the real JSONBin
- *      API key lives only in this Worker's secrets and is never sent to
- *      the browser.
+ *   3. /api/sync is a server-side proxy to Cloudflare KV — the handover
+ *      data is stored directly in a KV namespace bound to this Worker.
+ *      There's no external API or key involved at all; KV access is via
+ *      the ASSETS-style binding Cloudflare wires up automatically.
  *   4. Anything else that passes auth is served from the static files in
  *      public/ via the ASSETS binding.
  *
@@ -21,7 +22,10 @@
 
 const COOKIE_NAME = "balter_session";
 const SESSION_MAX_AGE_SECONDS = 60 * 60 * 24 * 30; // 30 days
-const JSONBIN_BASE = "https://api.jsonbin.io/v3/b";
+// Single KV key holding the whole synced record ({ days: {...}, savedAt }).
+// One key is enough — this site only ever needs one shared blob, same as
+// the single JSONBin bin it replaces.
+const KV_KEY = "handover-data";
 
 export default {
   async fetch(request, env, ctx) {
@@ -181,33 +185,30 @@ function base64UrlToBuf(str) {
 }
 
 /* ---------------------------------------------------------
-   JSONBin proxy — the real API key stays server-side
+   SYNC PROXY — Cloudflare KV, bound directly to this Worker
 --------------------------------------------------------- */
 
 async function handleSyncProxy(request, env) {
-  const binId = env.JSONBIN_BIN_ID;
-  const apiKey = env.JSONBIN_API_KEY;
-  if (!binId || !apiKey) {
+  if (!env.HANDOVER_KV) {
     return jsonResponse({ ok: false, error: "not_configured" }, 501);
   }
 
   if (request.method === "GET") {
-    const res = await fetch(JSONBIN_BASE + "/" + binId + "/latest", {
-      headers: { "X-Master-Key": apiKey }
-    });
-    const body = await res.text();
-    return new Response(body, { status: res.status, headers: { "Content-Type": "application/json" } });
+    const value = await env.HANDOVER_KV.get(KV_KEY, "json");
+    return jsonResponse({ record: value || null }, 200);
   }
 
   if (request.method === "PUT") {
     const body = await request.text();
-    const res = await fetch(JSONBIN_BASE + "/" + binId, {
-      method: "PUT",
-      headers: { "Content-Type": "application/json", "X-Master-Key": apiKey, "X-Bin-Versioning": "false" },
-      body
-    });
-    const text = await res.text();
-    return new Response(text, { status: res.status, headers: { "Content-Type": "application/json" } });
+    // Reject anything that isn't valid JSON before it ever reaches
+    // storage, so a malformed request can't corrupt the shared record.
+    try {
+      JSON.parse(body);
+    } catch (err) {
+      return jsonResponse({ ok: false, error: "invalid_json" }, 400);
+    }
+    await env.HANDOVER_KV.put(KV_KEY, body);
+    return jsonResponse({ ok: true }, 200);
   }
 
   return jsonResponse({ ok: false, error: "method_not_allowed" }, 405);

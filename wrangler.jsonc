@@ -14,10 +14,10 @@
   },
   "kv_namespaces": [
     {
-      // The binding name the Worker code reads as env.LOGISTICS_KV.
-      "binding": "LOGISTICS_KV",
+      // The binding name the Worker code reads as env.HANDOVER_KV.
+      "binding": "HANDOVER_KV",
       // Replace with the real namespace ID after creating it — see README.md
-      // ("wrangler kv namespace create LOGISTICS_KV", or via the dashboard).
+      // ("wrangler kv namespace create HANDOVER_KV", or via the dashboard).
       "id": "cb7451b310524eec974d25290be537b1"
     }
   ]

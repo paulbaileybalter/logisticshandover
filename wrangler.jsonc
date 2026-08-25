@@ -1,0 +1,24 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "logisticshandover",
+  "main": "src/worker.js",
+  "compatibility_date": "2026-08-01",
+  "assets": {
+    "directory": "./public",
+    "binding": "ASSETS",
+    // Every request — including static files — is routed to the Worker
+    // first, so the password/session check below runs before anything is
+    // served. Without this, Cloudflare would serve public/ files directly
+    // and the Worker would never see those requests.
+    "run_worker_first": true
+  },
+  "kv_namespaces": [
+    {
+      // The binding name the Worker code reads as env.LOGISTICS_KV.
+      "binding": "LOGISTICS_KV",
+      // Replace with the real namespace ID after creating it — see README.md
+      // ("wrangler kv namespace create LOGISTICS_KV", or via the dashboard).
+      "id": "cb7451b310524eec974d25290be537b1"
+    }
+  ]
+}

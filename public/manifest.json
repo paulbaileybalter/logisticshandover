@@ -1,0 +1,13 @@
+{
+  "name": "Balter Brewing — Logistics Daily Handover",
+  "short_name": "Logistics Handover",
+  "start_url": ".",
+  "display": "standalone",
+  "background_color": "#ffffff",
+  "theme_color": "#47D7AC",
+  "icons": [
+    { "src": "assets/favicon-16.png", "sizes": "16x16", "type": "image/png" },
+    { "src": "assets/favicon-32.png", "sizes": "32x32", "type": "image/png" },
+    { "src": "assets/apple-touch-icon.png", "sizes": "180x180", "type": "image/png" }
+  ]
+}

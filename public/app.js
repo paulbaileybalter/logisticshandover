@@ -202,6 +202,16 @@
     var daily;
     if (!raw) {
       daily = newDailyState(dateISO);
+      // This is a brand-new, never-saved-locally sheet — mark it as having
+      // no real age at all (rather than "now") so that ANY genuine remote
+      // data for this date, however old, is treated as more authoritative
+      // than an empty placeholder the moment the first cloud sync runs.
+      // Without this, a device opening the sheet for the first time that
+      // day would stamp its blank state with the current time, which is
+      // later than colleagues' earlier real saves — so the sync check
+      // would wrongly conclude the blank sheet was "newer" and never pull
+      // their data in.
+      daily.updatedAt = 0;
       // Carry the previous day's wrap-up over as a starting point for today,
       // since it doubles as "yesterday's handover notes" at the top of the sheet.
       var idx = lsGet(LS_INDEX) || [];

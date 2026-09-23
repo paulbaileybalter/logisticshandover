@@ -103,6 +103,7 @@
       date: dateISO,
       wrapUp: [""],
       amPriorities: [""],
+      additionalTasks: [newAdditionalTask()],
       lockups: { logistics: "", cr1: "" },
       outbounds: [newOutbound()],
       inbounds: [newInbound()],
@@ -122,6 +123,7 @@
   function newPlanRow() { return { id: uid(), sku: "", location: "", status: "" }; }
   function newRoster() { return { id: uid(), time: "", name: "" }; }
   function newCheck() { return { id: uid(), text: "", done: false }; }
+  function newAdditionalTask() { return { id: uid(), text: "", assignee: "" }; }
 
   /* ---------------------------------------------------------
      SANITIZERS — repair/migrate any saved record (local or
@@ -137,6 +139,7 @@
   function sanitizePlanRow(r) { r = r || {}; return { id: r.id || uid(), sku: r.sku || "", location: r.location || "", status: r.status || "" }; }
   function sanitizeRoster(r) { r = r || {}; return { id: r.id || uid(), time: r.time || "", name: r.name || "" }; }
   function sanitizeCheck(r) { r = r || {}; return { id: r.id || uid(), text: typeof r.text === "string" ? r.text : "", done: r.done === true }; }
+  function sanitizeAdditionalTask(r) { r = r || {}; return { id: r.id || uid(), text: r.text || "", assignee: r.assignee || "" }; }
 
   function sanitizeDaily(d, dateISO) {
     var out = newDailyState(dateISO);
@@ -144,6 +147,7 @@
 
     out.wrapUp = sanitizeStrList(d.wrapUp);
     out.amPriorities = sanitizeStrList(d.amPriorities);
+    out.additionalTasks = (Array.isArray(d.additionalTasks) && d.additionalTasks.length) ? d.additionalTasks.map(sanitizeAdditionalTask) : out.additionalTasks;
     if (d.lockups) {
       out.lockups.logistics = typeof d.lockups.logistics === "string" ? d.lockups.logistics : "";
       out.lockups.cr1 = typeof d.lockups.cr1 === "string" ? d.lockups.cr1 : "";
@@ -191,13 +195,17 @@
   /* ---------------------------------------------------------
      APP STATE
   --------------------------------------------------------- */
-  var App = { date: todayISO(), daily: null, saveTimer: null, pollTimer: null, dirty: false };
+  var App = { date: todayISO(), daily: null, saveTimer: null, pollTimer: null, dirty: false, baseline: null };
 
   /* ---------------------------------------------------------
      LOAD / SWITCH DAY
   --------------------------------------------------------- */
   function loadDay(dateISO, skipWeatherAutofill) {
     App.date = dateISO;
+    // A fresh date means we no longer have a confirmed "last agreed with
+    // the server" snapshot for it — reset until the next successful sync
+    // round-trip establishes one. See pushToCloud() for why this matters.
+    App.baseline = null;
     var raw = lsGet(LS_DAY + dateISO);
     var daily;
     if (!raw) {
@@ -267,13 +275,55 @@
 
   function cloudReady() { return cloudState === "available"; }
 
+  // Fields on a day's record that reflect genuine section content, as
+  // opposed to bookkeeping (date/updatedAt), which the merge below handles
+  // separately.
+  var DAY_MERGE_FIELDS = [
+    "wrapUp", "amPriorities", "additionalTasks", "lockups", "outbounds", "inbounds",
+    "deliveries", "packagingPlan", "checks", "roster", "whoOff",
+    "safety", "weather"
+  ];
+
+  // Three-way merge: for each top-level section of the day, if THIS device
+  // changed it since the last state we both agreed on (baseline), our
+  // version wins for that section; otherwise, whatever the server currently
+  // has for that section wins (i.e. some other device's edit we haven't
+  // seen locally, which we didn't touch, so there's nothing to conflict
+  // with). This is what stops one device's save from wiping out a
+  // different section someone else just saved — the previous behaviour
+  // replaced the WHOLE day's record with whichever device saved last,
+  // discarding anything the other device had changed, even in a totally
+  // different section of the sheet.
+  function mergeDayThreeWay(baseline, local, remote) {
+    var merged = {};
+    DAY_MERGE_FIELDS.forEach(function (key) {
+      var localChanged = JSON.stringify(local[key]) !== JSON.stringify(baseline[key]);
+      merged[key] = localChanged ? local[key] : (key in remote ? remote[key] : local[key]);
+    });
+    merged.date = local.date;
+    merged.updatedAt = Date.now();
+    return merged;
+  }
+
   function pushToCloud() {
     if (cloudState === "unavailable") return;
     fetchCloud().then(function (remote) {
       if (cloudState === "unavailable") return null;
       remote = remote || { days: {} };
       remote.days = remote.days || {};
-      remote.days[App.date] = App.daily;
+      var remoteDay = remote.days[App.date];
+      var dayToSave;
+      if (App.baseline && remoteDay && remoteDay.updatedAt !== App.baseline.updatedAt) {
+        // Someone else saved this date since we last knew its state —
+        // merge instead of blindly overwriting their changes.
+        dayToSave = mergeDayThreeWay(App.baseline, App.daily, sanitizeDaily(remoteDay, App.date));
+        App.daily = dayToSave;
+        renderAll();
+      } else {
+        dayToSave = App.daily;
+        dayToSave.updatedAt = Date.now();
+      }
+      remote.days[App.date] = dayToSave;
       remote.savedAt = Date.now();
       return fetch("/api/sync", {
         method: "PUT",
@@ -283,8 +333,13 @@
     }).then(function (res) {
       if (!res) return;
       if (res.status === 501) { cloudState = "unavailable"; setSyncStatus("saved"); return; }
-      if (res.ok) { cloudState = "available"; setSyncStatus("saved"); }
-      else setSyncStatus("error");
+      if (res.ok) {
+        cloudState = "available";
+        // This save succeeded, so local and server now agree — record that
+        // as the new baseline for future conflict checks.
+        App.baseline = JSON.parse(JSON.stringify(App.daily));
+        setSyncStatus("saved");
+      } else setSyncStatus("error");
     }).catch(function () { setSyncStatus("error"); });
   }
 
@@ -313,6 +368,11 @@
         renderAll();
         showToast("Updated from another device");
       }
+      // Whatever App.daily now reflects is, as far as this device knows,
+      // in agreement with the server — record it as the baseline for the
+      // next save's conflict check, whether that came from remote just now
+      // or was already the case.
+      App.baseline = JSON.parse(JSON.stringify(App.daily));
       setSyncStatus("saved");
     }).catch(function () { setSyncStatus("error"); });
   }
@@ -480,12 +540,25 @@
           '<p class="plan-sub" style="margin-top:18px;">AM Priorities</p>' +
           '<div class="wrap-list" id="amList">' + lineListHtml("amPriorities", "What needs doing first…") + '</div>' +
           '<button class="add-row-btn" type="button" id="addAmRow">+ Add line</button>' +
+          '<p class="plan-sub" style="margin-top:18px;">Additional Tasks</p>' +
+          '<div id="taskRows">' + d.additionalTasks.map(taskRow).join("") + '</div>' +
+          '<button class="add-row-btn" type="button" id="addTaskRow">+ Add task</button>' +
         '</div>' +
         '<div class="lockup-col">' +
           lockupTile("logistics", "Logistics lock up", LOCKUP_OPTIONS_LOGISTICS) +
           lockupTile("cr1", "CR1 lock up", LOCKUP_OPTIONS_LOGISTICS) +
         '</div>' +
       '</div>';
+
+    function taskRow(t) {
+      return '<div class="task-row" data-row="' + t.id + '">' +
+        '<input type="text" class="task-text" data-f="text" value="' + esc(t.text) + '" placeholder="Task">' +
+        '<select class="task-assignee" data-f="assignee"><option value="">Assign to…</option>' +
+        STAFF_OPTIONS.map(function (s) { return '<option value="' + esc(s) + '"' + (s === t.assignee ? " selected" : "") + '>' + esc(s) + '</option>'; }).join("") +
+        '</select>' +
+        '<button class="icon-btn" type="button" data-del="' + t.id + '" title="Remove">✕</button>' +
+      '</div>';
+    }
 
     function lineListHtml(field, placeholder) {
       return d[field].map(function (text, i) {
@@ -523,6 +596,11 @@
     });
     document.getElementById("addAmRow").addEventListener("click", function () {
       d.amPriorities.push("");
+      scheduleSave(); renderWrap();
+    });
+    bindRowInputsSafe(document.getElementById("taskRows"), d.additionalTasks, renderWrap, newAdditionalTask);
+    document.getElementById("addTaskRow").addEventListener("click", function () {
+      d.additionalTasks.push(newAdditionalTask());
       scheduleSave(); renderWrap();
     });
     el.querySelectorAll("[data-lockup]").forEach(function (select) {
@@ -849,6 +927,14 @@
     if (!d.amPriorities.some(function (t) { return t && t.trim(); })) html += '<tr>' + td("—") + '</tr>';
     html += '</table>';
 
+    html += sectionTitle("Additional Tasks", C.mint);
+    html += '<table style="border-collapse:collapse;width:100%;max-width:900px;"><tr>' + th("Task") + th("Assigned to", "width:28%") + '</tr>';
+    d.additionalTasks.forEach(function (t) {
+      if (!t.text && !t.assignee) return;
+      html += '<tr>' + td(esc(t.text) || "—") + td(esc(t.assignee) || "—", "font-weight:bold;") + '</tr>';
+    });
+    html += '</table>';
+
     html += '<table style="border-collapse:collapse;width:100%;max-width:900px;margin-top:14px;">';
     html += '<tr>' + th("Logistics lock up", "width:50%") + th("CR1 lock up") + '</tr>';
     html += '<tr>' + td(esc(d.lockups.logistics) || "—", "font-weight:bold;") + td(esc(d.lockups.cr1) || "—", "font-weight:bold;") + '</tr>';
@@ -939,6 +1025,9 @@
     d.amPriorities.filter(function (t) { return t && t.trim(); }).forEach(function (t) { lines.push("  - " + t); });
     lines.push("  Logistics lock up: " + (d.lockups.logistics || "–"));
     lines.push("  CR1 lock up: " + (d.lockups.cr1 || "–"));
+    lines.push("");
+    lines.push("ADDITIONAL TASKS");
+    d.additionalTasks.forEach(function (t) { if (!t.text && !t.assignee) return; lines.push("  " + (t.text || "–") + " — " + (t.assignee || "Unassigned")); });
     lines.push("");
     lines.push("OUTBOUND");
     d.outbounds.forEach(function (r) { if (!r.destination && !r.qty) return; lines.push("  " + (r.destination || "–") + " (Qty " + (r.qty || "–") + ")"); });
@@ -1045,7 +1134,7 @@
         .catch(function () { window.location.href = "/login"; });
     });
     document.getElementById("clearBtn").addEventListener("click", function () {
-      var ok = window.confirm("Clear all fields on " + formatPretty(App.date) + "'s sheet?\n\nThis resets wrap-up, AM priorities, lock ups, outbound/inbound, deliveries, packaging plan, checks, roster, safety, and weather for this day. This can't be undone.");
+      var ok = window.confirm("Clear all fields on " + formatPretty(App.date) + "'s sheet?\n\nThis resets wrap-up, AM priorities, additional tasks, lock ups, outbound/inbound, deliveries, packaging plan, checks, roster, safety, and weather for this day. This can't be undone.");
       if (!ok) return;
       App.daily = newDailyState(App.date);
       saveNow(false);

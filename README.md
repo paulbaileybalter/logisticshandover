@@ -155,31 +155,124 @@ box without touching your real production KV namespace.
 - The **Log out** button in the top bar clears the session cookie and
   sends everyone back to `/login`.
 
-## Multi-device sync — same as before, now on Cloudflare KV
+## How multi-device sync works (and what it can't promise)
 
-Cloud sync behaves exactly like it did previously (autosave, live sync
-across devices, the green/amber/red dot in the top bar) — the only
-difference is *where* the data lives. `config.js` has nowhere to put sync
-credentials because there aren't any anymore; the site detects at runtime
-whether the Worker has the KV binding configured and adapts automatically.
+Every computer keeps its own copy of each day in the browser, and syncs it
+with one shared copy stored in Cloudflare KV, through the site's own
+`/api/sync` address. The page is the same on every computer; nothing secret
+is ever sent to the browser.
 
-One thing worth knowing about KV specifically: writes can take up to about
-a minute to become visible from a *different* Cloudflare data centre (KV is
-eventually consistent, not instant, globally). In practice this is rarely
-noticeable for a small team's daily sheet — the site already polls every
-20 seconds — but if two people save near-simultaneously from opposite
-sides of the country, the very latest write might take a few extra seconds
-to show up everywhere.
+**The rules that keep people from overwriting each other** (all covered by the
+automated tests in `tests/`):
 
-### Migrating existing data from the old JSONBin version
+- **Baseline.** Each computer remembers the last copy of the day that the
+  *server* is known to hold. It is only set from what the server returned, or
+  from exactly what this computer sent after a confirmed save. It is stored in
+  the browser, so reloading or a short outage doesn't lose it.
+- **Merge by section.** When saving, the page first fetches the shared copy.
+  For each section of the sheet (wrap-up, AM priorities, additional tasks,
+  lock-ups, outbound, inbound, deliveries, packaging plan, checks, roster,
+  absent staff, safety, weather): if *this* computer changed it since the
+  baseline, this computer's version wins; otherwise the shared version wins.
+  So two people editing *different* sections never overwrite each other.
+- **A brand-new computer** (or a day it has never edited) merges with the
+  shared copy instead of ignoring it, so it opens showing everyone's work.
+- **Revision ids, not clocks.** Each save gets a random revision id. The page
+  only ever asks "is this the same revision?", never "which is newer?", so
+  computers with different clocks can't confuse it.
+- **Reads are strict.** If a read fails, the page treats it as an error — never
+  as "nothing stored" — so one failed read can't lead to a save that wipes
+  other days.
+- **One sync at a time**, with edits made meanwhile gathered into a follow-up.
+- **Read-back.** After saving, the page reads the shared copy back. If another
+  computer's save landed after ours, it merges theirs in and sends again
+  (up to 3 tries).
+- **Outages heal themselves.** If a save fails, the edit stays on that
+  computer (and survives a reload). At the next background check it is sent
+  automatically.
+- **Your cursor stays put** when the screen refreshes with someone else's change.
+- **Housekeeping.** Days older than 21 days are removed from the *shared*
+  copy on each save (each computer keeps its own history). The page checks for
+  changes every 45 seconds, only while the tab is visible. The status pill
+  explains any problem when you hover over it.
 
-If this site was previously running on JSONBin and you want to carry
-today's data across rather than starting fresh in KV: log into the old
-version, open the browser console, and run a quick fetch against the old
-JSONBin bin to grab the current record, then — once the KV version is
-deployed and you're logged into it — `PUT` that same JSON to `/api/sync`
-from the console while logged in. Happy to walk through the exact commands
-if you want to do this rather than just letting the sheet start fresh.
+### Known limits — please read
+
+1. **Two people saving in the same fraction of a second can very occasionally
+   still lose an edit.** Cloudflare KV has no "only save if nobody else has"
+   operation (no atomic compare-and-swap), so this can't be fully closed here.
+   In 40 simulated races with 3 computers editing at once, no edit was lost;
+   on a deliberately slow, erratic simulated network, none in 20. That is a
+   good sign, not a guarantee.
+2. **Two people editing the *same section* at the same time:** the later save
+   of that whole section wins (for example, two people adding rows to the
+   Outbound table in the same moment). Different sections are safe.
+3. **KV is "eventually consistent".** A change made through one Cloudflare
+   location can take up to a minute or more to appear through another. All of
+   your team is in one city, so you will almost always use the same location,
+   but a phone hotspot or a different internet provider can be routed
+   elsewhere. In that rare case a computer can briefly see slightly old data
+   (and, in the worst case, a very recent edit by someone else could be
+   overwritten). If this ever looks like it is happening, the proper fix is to
+   move the shared copy to a Cloudflare **Durable Object**, which gives
+   one-at-a-time, instantly consistent saves. That is a bigger change than
+   this update; it can be done as a follow-up.
+4. **Free-plan allowance.** On Cloudflare's *free* Workers plan, KV allows
+   **1,000 writes and 100,000 reads per day**, resetting at 00:00 UTC, which is
+   **10:00 am Brisbane time**. Each saved edit costs 1 write and 2 reads;
+   background checks cost 1 read each (about 80 an hour per open tab). If the
+   write allowance runs out, saves fail until the reset: the pill turns red and
+   its hover text says why. Nothing is lost — edits stay on each computer and
+   send themselves after the reset. You can watch usage in the Cloudflare
+   dashboard (Storage & Databases → KV → your namespace → Metrics). The paid
+   Workers plan (about US$5/month) removes the cap.
+5. **Switching to a different date within about a second of editing** can leave
+   that edit waiting on the computer until that date is opened again (it is
+   never lost, and it then sends automatically).
+6. **Old days are deleted from the shared copy after 21 days.** They remain on
+   any computer that viewed them.
+
+## Deploying an update (not the first-time setup)
+
+Cloudflare builds from GitHub, so deploying means putting the new files in your
+repo and pushing. **Only copy the files in the update list; do not overwrite
+`wrangler.jsonc`** — in this project it may hold your real KV namespace ID,
+and the copy inside a downloaded zip only has a placeholder.
+
+1. Copy these files from the zip over the same-named files in your repo folder:
+   `public/app.js`, `public/index.html`, `public/config.js`, `src/worker.js`,
+   `README.md`, and the whole `tests/` folder.
+2. Commit and push (GitHub Desktop: write a summary, "Commit to main", "Push origin").
+3. In Cloudflare: Workers & Pages → your Worker → **Deployments** — wait for the
+   newest build to show success.
+4. Open the site, press **Ctrl+F5** once on each computer, log in, and check the
+   pill in the top bar says "Synced across devices".
+
+**If the site says it is "missing SITE_PASSWORD / SESSION_SECRET" after the
+deploy:** editing `src/worker.js` can make Cloudflare drop the dashboard secrets
+from the active version. Go to the Worker → **Settings → Variables and Secrets**
+and check both secrets are listed (re-add them if not), then **Deployments /
+Version History → promote the newest version**. Also check **Settings →
+Bindings** still lists your KV namespace as `HANDOVER_KV`. `"run_worker_first":
+true` in `wrangler.jsonc` must stay — it is what puts the password gate in front
+of every file.
+
+## Running the tests (developers)
+
+Needs Node 18+. From the repo folder:
+
+```
+cd tests
+node scenarios.js                        # 13 checks: new browser, simultaneous saves, outage recovery...
+node scenarios_site.js                   # 22 Logistics-specific checks (weather race, Additional Tasks...)
+node stress.js                           # 3 computers racing, 40 trials — should lose 0 edits
+SLOW=1 VERIFY_MS=400 node stress.js      # same on a slow, erratic network, 20 trials
+node worker_test.mjs                     # 21 checks on src/worker.js
+```
+
+`APP_SRC=/path/to/old/app.js node scenarios.js` runs the same tests against any
+other version of the page. `tests/dom_test.js` (optional) runs the real page in a
+full simulated browser; it needs `npm install jsdom` first.
 
 ## Safety tip rotation & weather auto-fill
 

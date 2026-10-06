@@ -49,12 +49,13 @@ export default {
         return Response.redirect(new URL("/login", url.origin).toString(), 302);
       }
 
-      if (path === "/api/sync") return handleSyncProxy(request, env);
+      if (path === "/api/sync") return await handleSyncProxy(request, env);
 
       // Authenticated — hand off to the static files in public/.
-      return env.ASSETS.fetch(request);
+      return await env.ASSETS.fetch(request);
     } catch (err) {
-      return jsonResponse({ ok: false, error: "server_error", message: String(err && err.message || err) }, 500);
+      const msg = String(err && err.message || err).slice(0, 300);
+      return jsonResponse({ ok: false, error: "server_error", status: 500, detail: msg, message: msg }, 500);
     }
   }
 };
@@ -188,26 +189,59 @@ function base64UrlToBuf(str) {
    SYNC PROXY — Cloudflare KV, bound directly to this Worker
 --------------------------------------------------------- */
 
+// Largest shared record accepted. Real data is a few KB per day and the page
+// drops days older than 21 days, so this only ever stops a runaway client.
+// (KV itself allows 25 MB per value; the old 100 KB limit was JSONBin's.)
+const MAX_BODY_BYTES = 1024 * 1024; // 1 MB
+
+// Turn a storage failure into a readable JSON answer the page can show,
+// instead of a generic Cloudflare error page. KV errors name the problem
+// (for example "429 Too Many Requests", or the daily free-plan limit).
+function storageError(err, doing) {
+  const msg = String(err && err.message || err).slice(0, 300);
+  const m = msg.match(/\b([45]\d\d)\b/);
+  return jsonResponse({ ok: false, error: "Storage error", status: m ? Number(m[1]) : 500, detail: doing + " failed: " + msg }, 502);
+}
+
 async function handleSyncProxy(request, env) {
   if (!env.HANDOVER_KV) {
     return jsonResponse({ ok: false, error: "not_configured" }, 501);
   }
 
   if (request.method === "GET") {
-    const value = await env.HANDOVER_KV.get(KV_KEY, "json");
-    return jsonResponse({ record: value || null }, 200);
+    try {
+      // cacheTtl 30 is the shortest KV allows: other Cloudflare locations
+      // may show a value up to this long after it changed.
+      const value = await env.HANDOVER_KV.get(KV_KEY, { type: "json", cacheTtl: 30 });
+      return jsonResponse({ record: value || null }, 200);
+    } catch (err) {
+      return storageError(err, "Reading shared data");
+    }
   }
 
   if (request.method === "PUT") {
     const body = await request.text();
-    // Reject anything that isn't valid JSON before it ever reaches
-    // storage, so a malformed request can't corrupt the shared record.
-    try {
-      JSON.parse(body);
-    } catch (err) {
-      return jsonResponse({ ok: false, error: "invalid_json" }, 400);
+    const bytes = new TextEncoder().encode(body).length;
+    if (bytes > MAX_BODY_BYTES) {
+      return jsonResponse({ ok: false, error: "Too large", status: 413,
+        detail: "Shared data is " + Math.round(bytes / 1024) + " KB; this site accepts up to " + Math.round(MAX_BODY_BYTES / 1024) + " KB." }, 413);
     }
-    await env.HANDOVER_KV.put(KV_KEY, body);
+    // Reject anything that isn't the expected shape before it reaches
+    // storage, so a malformed request can't wipe or corrupt the shared record.
+    let parsed;
+    try {
+      parsed = JSON.parse(body);
+    } catch (err) {
+      return jsonResponse({ ok: false, error: "invalid_json", status: 400, detail: "The data sent was not valid JSON." }, 400);
+    }
+    if (!parsed || typeof parsed !== "object" || !parsed.days || typeof parsed.days !== "object") {
+      return jsonResponse({ ok: false, error: "invalid_shape", status: 400, detail: "The data sent was missing its days." }, 400);
+    }
+    try {
+      await env.HANDOVER_KV.put(KV_KEY, body);
+    } catch (err) {
+      return storageError(err, "Saving shared data");
+    }
     return jsonResponse({ ok: true }, 200);
   }
 

@@ -18,7 +18,7 @@
  */
 window.HANDOVER_CONFIG = {
   cloudSync: {
-    pollSeconds: 20        // how often other devices are checked for updates
+    pollSeconds: 45        // how often other devices are checked for updates (visible tab only)
   },
 
   /**

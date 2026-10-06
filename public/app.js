@@ -11,6 +11,7 @@
   var LS_PREFIX = "balterLogistics:";
   var LS_DAY = LS_PREFIX + "day:";
   var LS_INDEX = LS_PREFIX + "index";
+  var LS_BASE_DAY = LS_PREFIX + "baseDay:";   // last copy of each day the SERVER is known to hold
 
   var LOCKUP_OPTIONS_LOGISTICS = ["Logistics", "Packaging", "Brewing", "Taproom", "Other"];
 
@@ -175,6 +176,7 @@
     }
 
     out.updatedAt = typeof d.updatedAt === "number" ? d.updatedAt : Date.now();
+    if (typeof d.rev === "string") out.rev = d.rev;
     return out;
   }
 
@@ -195,17 +197,29 @@
   /* ---------------------------------------------------------
      APP STATE
   --------------------------------------------------------- */
-  var App = { date: todayISO(), daily: null, saveTimer: null, pollTimer: null, dirty: false, baseline: null };
+  var App = {
+    date: todayISO(),
+    daily: null,
+    saveTimer: null,
+    pollTimer: null,
+    dirty: false,
+    // "Baseline" = the last copy of the day that the SERVER is known to hold
+    // (what we last read from it, or last successfully wrote to it). It is
+    // persisted per date so it survives reloads and outages. Three-way
+    // merging compares local edits against it to tell "I changed this
+    // section" from "someone else changed it".
+    baseline: null,
+    // For a day this browser has never touched: the untouched default it
+    // started from. Lets a brand-new browser merge in the server copy
+    // (untouched sections take the server's version) instead of ignoring it.
+    pristineBase: null
+  };
 
   /* ---------------------------------------------------------
      LOAD / SWITCH DAY
   --------------------------------------------------------- */
   function loadDay(dateISO, skipWeatherAutofill) {
     App.date = dateISO;
-    // A fresh date means we no longer have a confirmed "last agreed with
-    // the server" snapshot for it — reset until the next successful sync
-    // round-trip establishes one. See pushToCloud() for why this matters.
-    App.baseline = null;
     var raw = lsGet(LS_DAY + dateISO);
     var daily;
     if (!raw) {
@@ -235,6 +249,9 @@
       daily = sanitizeDaily(raw, dateISO);
     }
     App.daily = daily;
+    var rawBaseDay = lsGet(LS_BASE_DAY + dateISO);
+    App.baseline = rawBaseDay ? sanitizeDaily(rawBaseDay, dateISO) : null;
+    App.pristineBase = (!raw && !App.baseline) ? deepCopy(daily) : null;
     addToIndex(dateISO);
     renderAll();
     document.getElementById("sheetDate").value = dateISO;
@@ -251,7 +268,9 @@
     lsSet(LS_DAY + App.date, App.daily);
     addToIndex(App.date);
     App.dirty = false;
-    setSyncStatus("saved");
+    // With sync on, the status stays "Saving…" until the push finishes (or
+    // fails) — it must not claim "Synced" before that.
+    if (cloudOff()) setSyncStatus("saved");
     if (toastMsg) showToast(toastMsg);
     pushToCloud();
   }
@@ -265,39 +284,82 @@
 
   /* ---------------------------------------------------------
      CLOUD SYNC — proxied server-side through this site's own Worker
-     at /api/sync. The real JSONBin API key lives only in the Worker's
-     secrets and never reaches this file or the browser. Availability is
-     discovered at runtime (the Worker returns 501 if it has no JSONBin
-     secrets configured) rather than read from a client-side config value.
+     at /api/sync, which stores the shared record in Cloudflare KV.
+     Nothing secret ever reaches the browser. Whether sync is switched on
+     is discovered at runtime (the Worker answers 501 if the KV storage
+     isn't attached), rather than read from a config value.
+
+     How it stays correct (see README "How sync works"):
+       - BASELINE = the last copy of the day that the SERVER is known to
+         hold. It is only ever set from what the server returned, or from
+         exactly what we sent after a verified write. Never from local
+         state. It is kept in localStorage so reloads/outages don't lose it.
+       - A day this browser has never edited keeps a "pristine base", so a
+         brand-new browser merges with the server instead of ignoring it.
+       - Each saved record carries a random `rev` id, compared for EQUALITY
+         only. Timestamps are never compared between computers.
+       - Merge per top-level section: changed here since baseline -> ours
+         wins; otherwise the server's version wins.
+       - Reads are strict: a failed read is an error, never "empty".
+       - One sync operation at a time; edits made meanwhile are coalesced.
+       - After writing, we read back; if another computer's save landed
+         after ours, we merge it in and send again (max 3 tries).
   --------------------------------------------------------- */
   var cloudCfg = (window.HANDOVER_CONFIG && window.HANDOVER_CONFIG.cloudSync) || {};
   var cloudState = "unknown"; // "unknown" | "available" | "unavailable"
 
   function cloudReady() { return cloudState === "available"; }
+  function cloudOff() { return cloudState === "unavailable"; }
+
+  /* ---- small helpers ------------------------------------------------ */
+  function deepCopy(o) { return JSON.parse(JSON.stringify(o)); }
+
+  // JSON.stringify with sorted keys, so two records that are the same but
+  // were built with keys in a different order still compare equal.
+  function stable(v) {
+    return JSON.stringify(v, function (k, val) {
+      if (val && typeof val === "object" && !Array.isArray(val)) {
+        var out = {};
+        Object.keys(val).sort().forEach(function (kk) { out[kk] = val[kk]; });
+        return out;
+      }
+      return val;
+    });
+  }
+  function newRev() { return Date.now().toString(36) + Math.random().toString(36).slice(2, 8); }
+  // A record's revision id. Records saved before revisions existed fall back
+  // to their timestamp. Compared for EQUALITY only (never "newer than"), so
+  // it doesn't matter if two computers' clocks disagree.
+  function revOf(r) { return r ? (r.rev || ("t" + r.updatedAt)) : null; }
+  function delay(ms) { return new Promise(function (resolve) { setTimeout(resolve, ms); }); }
+
+  var KEEP_DAYS = 21;                       // older days are dropped from the shared store
+  var MAX_PUSH_ATTEMPTS = 3;
+  var VERIFY_DELAY_MS = (typeof cloudCfg.verifyDelayMs === "number") ? cloudCfg.verifyDelayMs : 400;
 
   // Fields on a day's record that reflect genuine section content, as
-  // opposed to bookkeeping (date/updatedAt), which the merge below handles
-  // separately.
+  // opposed to bookkeeping (date / updatedAt / rev). EVERY content key in
+  // newDailyState() must be listed here — a missed key silently loses
+  // conflict protection. (A test checks this list against newDailyState.)
   var DAY_MERGE_FIELDS = [
     "wrapUp", "amPriorities", "additionalTasks", "lockups", "outbounds", "inbounds",
     "deliveries", "packagingPlan", "checks", "roster", "whoOff",
     "safety", "weather"
   ];
 
-  // Three-way merge: for each top-level section of the day, if THIS device
-  // changed it since the last state we both agreed on (baseline), our
-  // version wins for that section; otherwise, whatever the server currently
-  // has for that section wins (i.e. some other device's edit we haven't
-  // seen locally, which we didn't touch, so there's nothing to conflict
-  // with). This is what stops one device's save from wiping out a
-  // different section someone else just saved — the previous behaviour
-  // replaced the WHOLE day's record with whichever device saved last,
-  // discarding anything the other device had changed, even in a totally
-  // different section of the sheet.
+  function daySections(d) {
+    var o = {};
+    DAY_MERGE_FIELDS.forEach(function (k) { o[k] = d[k]; });
+    return o;
+  }
+
+  // Three-way merge. For each section of the day: if THIS device changed it
+  // since the baseline, our version wins; otherwise whatever the server
+  // currently has wins (another device's edit we haven't seen yet).
   function mergeDayThreeWay(baseline, local, remote) {
     var merged = {};
     DAY_MERGE_FIELDS.forEach(function (key) {
-      var localChanged = JSON.stringify(local[key]) !== JSON.stringify(baseline[key]);
+      var localChanged = stable(local[key]) !== stable(baseline[key]);
       merged[key] = localChanged ? local[key] : (key in remote ? remote[key] : local[key]);
     });
     merged.date = local.date;
@@ -305,85 +367,212 @@
     return merged;
   }
 
-  function pushToCloud() {
-    if (cloudState === "unavailable") return;
-    fetchCloud().then(function (remote) {
-      if (cloudState === "unavailable") return null;
-      remote = remote || { days: {} };
-      remote.days = remote.days || {};
-      var remoteDay = remote.days[App.date];
-      var dayToSave;
-      if (App.baseline && remoteDay && remoteDay.updatedAt !== App.baseline.updatedAt) {
-        // Someone else saved this date since we last knew its state —
-        // merge instead of blindly overwriting their changes.
-        dayToSave = mergeDayThreeWay(App.baseline, App.daily, sanitizeDaily(remoteDay, App.date));
-        App.daily = dayToSave;
-        renderAll();
-      } else {
-        dayToSave = App.daily;
-        dayToSave.updatedAt = Date.now();
+  /* ---- reconcile: fold the server's copy into what's on screen ------- */
+
+  function setDayBaseline(remote) {
+    App.baseline = deepCopy(remote);
+    App.pristineBase = null;
+    lsSet(LS_BASE_DAY + App.date, App.baseline);
+  }
+
+  // Returns true if what's on screen changed.
+  function reconcileDay(remoteRaw) {
+    if (!remoteRaw) return false;
+    var remote = sanitizeDaily(remoteRaw, App.date);
+    if (App.baseline && revOf(remote) === revOf(App.baseline)) return false;   // server unchanged since we last synced
+    var base = App.baseline || App.pristineBase;
+    var before = stable(daySections(App.daily));
+    if (base) {
+      App.daily = mergeDayThreeWay(base, App.daily, remote);
+    } else if (remote.updatedAt > App.daily.updatedAt) {
+      App.daily = remote;                       // old local copy from before baselines existed
+    } else {
+      return false;                             // local is newer and unbaselined: it will simply be pushed
+    }
+    setDayBaseline(remote);
+    return stable(daySections(App.daily)) !== before;
+  }
+
+  // Does this device hold edits the server hasn't got yet?
+  function hasUnsyncedLocal() {
+    var dayBase = App.baseline || App.pristineBase;
+    return dayBase ? stable(daySections(App.daily)) !== stable(daySections(dayBase)) : true;
+  }
+
+  function persistLocal() {
+    lsSet(LS_DAY + App.date, App.daily);
+  }
+
+  /* ---- talking to /api/sync ------------------------------------------ */
+
+  // Turn a failed response into an Error carrying a readable explanation.
+  function httpError(res) {
+    if (res.status === 401) {
+      var e401 = new Error("signed out");
+      e401.detail = "Signed out \u2014 refresh the page and sign in again.";
+      return Promise.resolve(e401);
+    }
+    return res.json().catch(function () { return {}; }).then(function (j) {
+      var e = new Error("HTTP " + res.status);
+      e.detail = "Sync failed (HTTP " + res.status + (j && j.status ? ", storage " + j.status : "") + ")" + (j && j.detail ? ": " + j.detail : "");
+      return e;
+    });
+  }
+
+  // Rejects on ANY failure. A failed read must never be mistaken for "the
+  // shared store is empty" — that used to make the next save wipe it. The
+  // only way this resolves to null is the Worker explicitly answering
+  // { record: null } (nothing has ever been saved).
+  function fetchCloud() {
+    return fetch("/api/sync").then(function (res) {
+      if (res.status === 501) {
+        cloudState = "unavailable";
+        var off = new Error("sync not configured");
+        off.notConfigured = true;
+        throw off;
       }
-      remote.days[App.date] = dayToSave;
-      remote.savedAt = Date.now();
+      if (!res.ok) return httpError(res).then(function (e) { throw e; });
+      return res.json();
+    }).then(function (json) {
+      if (!json || typeof json !== "object" || !("record" in json)) {
+        var bad = new Error("unexpected response");
+        bad.detail = "Sync failed: the server sent an unexpected reply.";
+        throw bad;
+      }
+      cloudState = "available";
+      return json.record;
+    });
+  }
+
+  // Keep the shared store small: every save and every check moves the whole
+  // record, so old days are dropped (this device keeps its own copies).
+  function pruneRemote(remote) {
+    var d = new Date();
+    d.setDate(d.getDate() - KEEP_DAYS);
+    var cutoffDay = toISO(d);
+    Object.keys(remote.days).forEach(function (k) { if (k < cutoffDay && k !== App.date) delete remote.days[k]; });
+  }
+
+  // One sync operation at a time. Edits made while one is running are
+  // picked up by a follow-up run, so requests can never overlap or land
+  // out of order.
+  var syncState = { busy: false, pushAgain: false, lastPullAt: 0, pullFails: 0 };
+
+  function pushToCloud() {
+    if (cloudOff()) return;
+    if (syncState.busy) { syncState.pushAgain = true; return; }
+    syncState.busy = true;
+    doPush(1).catch(function (err) {
+      if (err && err.notConfigured) { setSyncStatus("saved"); return; }
+      setSyncStatus("error", err);
+    }).then(function () {
+      syncState.busy = false;
+      if (syncState.pushAgain) { syncState.pushAgain = false; pushToCloud(); }
+    });
+  }
+
+  function commitBaseline(sent) {
+    if (App.date === sent.date) {
+      App.baseline = deepCopy(sent.day); App.pristineBase = null;
+      lsSet(LS_BASE_DAY + sent.date, App.baseline);
+    }
+  }
+
+  function doPush(attempt) {
+    var dateAtStart = App.date;
+    return fetchCloud().then(function (remote) {
+      if (App.date !== dateAtStart) return null;       // user switched day mid-flight; next save handles it
+      remote = remote || {};
+      remote.days = remote.days || {};
+
+      // Fold in anything another device saved since we last synced.
+      var changed = reconcileDay(remote.days[App.date]);
+      if (changed) { persistLocal(); renderAll(); }
+
+      var now = Date.now(), rev = newRev();
+      App.daily.updatedAt = now; App.daily.rev = rev;
+      var sent = { date: App.date, day: deepCopy(App.daily) };
+
+      remote.days[sent.date] = sent.day;
+      pruneRemote(remote);
+      remote.savedAt = now;
       return fetch("/api/sync", {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(remote)
+      }).then(function (res) {
+        if (!res.ok) return httpError(res).then(function (e) { throw e; });
+        return sent;
       });
-    }).then(function (res) {
-      if (!res) return;
-      if (res.status === 501) { cloudState = "unavailable"; setSyncStatus("saved"); return; }
-      if (res.ok) {
-        cloudState = "available";
-        // This save succeeded, so local and server now agree — record that
-        // as the new baseline for future conflict checks.
-        App.baseline = JSON.parse(JSON.stringify(App.daily));
-        setSyncStatus("saved");
-      } else setSyncStatus("error");
-    }).catch(function () { setSyncStatus("error"); });
+    }).then(function (sent) {
+      if (!sent) return;
+      // Read it back: if another device's save landed after ours (they read
+      // the store before our write, so theirs doesn't include our edits),
+      // merge theirs in and send again rather than silently losing ours.
+      return delay(VERIFY_DELAY_MS).then(function () { return fetchCloud(); }).then(function (check) {
+        check = check || {};
+        var rd = check.days && check.days[sent.date];
+        var ours = rd && revOf(rd) === sent.day.rev;
+        if (ours) { commitBaseline(sent); return; }
+        if (attempt < MAX_PUSH_ATTEMPTS) return doPush(attempt + 1);
+        // Gave up for now: leave the baseline alone, so these edits still
+        // count as unsynced and the next background check sends them again.
+      }, function () {
+        commitBaseline(sent);                           // couldn't verify; assume our write stuck
+      });
+    }).then(function () {
+      persistLocal();
+      setSyncStatus("saved");
+    });
   }
 
-  // Resolves the current remote record, and — as a side effect — updates
-  // cloudState based on what the Worker actually reports (501 = no
-  // JSONBin secrets configured server-side, so sync is simply off).
-  function fetchCloud() {
-    return fetch("/api/sync").then(function (res) {
-      if (res.status === 501) { cloudState = "unavailable"; return null; }
-      if (!res.ok) return null;
-      cloudState = "available";
-      return res.json();
-    }).then(function (json) { return json && json.record ? json.record : null; })
-      .catch(function () { return null; });
-  }
-
+  // Returns a promise that settles when this check is finished (it also
+  // resolves straight away if a check isn't needed right now). Start-up
+  // waits on it before running the weather auto-fill.
   function pullFromCloud(isBackground) {
-    if (cloudState === "unavailable") return Promise.resolve();
+    if (cloudOff() || syncState.busy) return Promise.resolve();
+    if (isBackground && Date.now() - syncState.lastPullAt < 4000) return Promise.resolve();   // focus + visibility fire together
+    syncState.lastPullAt = Date.now();
+    syncState.busy = true;
     if (!isBackground) setSyncStatus("saving");
     return fetchCloud().then(function (remote) {
-      if (cloudState === "unavailable") { setSyncStatus("saved"); return; }
-      if (!remote) { if (!isBackground) setSyncStatus("saved"); return; }
-      var remoteDayRaw = remote.days && remote.days[App.date];
-      if (remoteDayRaw && (!App.daily.updatedAt || remoteDayRaw.updatedAt > App.daily.updatedAt)) {
-        App.daily = sanitizeDaily(remoteDayRaw, App.date);
-        renderAll();
-        showToast("Updated from another device");
-      }
-      // Whatever App.daily now reflects is, as far as this device knows,
-      // in agreement with the server — record it as the baseline for the
-      // next save's conflict check, whether that came from remote just now
-      // or was already the case.
-      App.baseline = JSON.parse(JSON.stringify(App.daily));
+      remote = remote || {};
+      var changed = reconcileDay(remote.days && remote.days[App.date]);
+      if (changed) { persistLocal(); renderAll(); showToast("Updated from another device"); }
+      syncState.pullFails = 0;
       setSyncStatus("saved");
-    }).catch(function () { setSyncStatus("error"); });
+    }).catch(function (err) {
+      if (err && err.notConfigured) { setSyncStatus("saved"); return; }
+      syncState.pullFails++;
+      // One missed background check is normal; say something after two.
+      if (!isBackground || syncState.pullFails >= 2) setSyncStatus("error", err);
+    }).then(function () {
+      syncState.busy = false;
+      // Anything that couldn't be sent earlier (an outage) goes out now.
+      if (syncState.pushAgain || (syncState.pullFails === 0 && !cloudOff() && hasUnsyncedLocal())) {
+        syncState.pushAgain = false;
+        pushToCloud();
+      }
+    });
   }
 
-  function setSyncStatus(state) {
+  function setSyncStatus(state, err) {
     var dot = document.getElementById("syncDot");
     var text = document.getElementById("syncText");
+    var pill = document.getElementById("syncStatus");
     dot.className = "sync-dot";
+    if (pill) pill.title = "Save status";
     if (state === "checking") { dot.classList.add("is-saving"); text.textContent = "Checking sync…"; }
     else if (state === "saving") { dot.classList.add("is-saving"); text.textContent = "Saving…"; }
-    else if (state === "error") { dot.classList.add("is-error"); text.textContent = cloudReady() ? "Sync error — saved locally" : "Saved to this device"; }
+    else if (state === "error") {
+      dot.classList.add("is-error");
+      text.textContent = cloudOff() ? "Saved to this device" : "Sync error — saved locally";
+      var detail = (err && err.detail) || (err ? "Network problem — will retry automatically." : "");
+      if (detail) {
+        if (pill) pill.title = detail + " (your changes are saved on this device and will sync automatically once this clears)";
+        if (window.console && console.warn) console.warn("[sync]", detail);
+      }
+    }
     else {
       dot.classList.add("is-saved");
       text.textContent = cloudReady() ? "Synced across devices" : "Saved to this device";
@@ -512,7 +701,50 @@
   /* ---------------------------------------------------------
      RENDER: ALL
   --------------------------------------------------------- */
+  // Re-rendering rebuilds every input, which would normally drop the
+  // cursor out of whatever field someone is typing in. Remember which
+  // field has focus (and where the caret is) and put it back afterwards.
+  // Fields are found again by their data-* attributes (plus their row, if
+  // they're in one) or, for the few plain fields, by id.
+  function captureFocus() {
+    var a = document.activeElement;
+    if (!a || !a.closest || !a.dataset) return null;
+    var section = a.closest("section[id]");
+    if (!section) return null;
+    var attrs = {};
+    Object.keys(a.dataset).forEach(function (k) { attrs[k] = a.dataset[k]; });
+    var id = a.id || null;
+    if (!Object.keys(attrs).length && !id) return null;
+    var row = a.closest("tr[data-row]") || a.closest("[data-row]");
+    var sig = { sectionId: section.id, tag: String(a.tagName || "").toLowerCase(), attrs: attrs, id: id, row: row ? row.dataset.row : null, selStart: null, selEnd: null };
+    try { if (typeof a.selectionStart === "number") { sig.selStart = a.selectionStart; sig.selEnd = a.selectionEnd; } } catch (e) { /* e.g. number inputs */ }
+    return sig;
+  }
+  function restoreFocus(sig) {
+    if (!sig) return;
+    var target = null;
+    if (!Object.keys(sig.attrs).length) {
+      target = sig.id ? document.getElementById(sig.id) : null;
+    } else {
+      var section = document.getElementById(sig.sectionId);
+      if (!section) return;
+      var sel = sig.tag;
+      Object.keys(sig.attrs).forEach(function (k) {
+        sel += "[data-" + k.replace(/[A-Z]/g, function (m) { return "-" + m.toLowerCase(); }) + '="' + String(sig.attrs[k]).replace(/"/g, '\\"') + '"]';
+      });
+      var scope = section;
+      if (sig.row) {
+        scope = section.querySelector('tr[data-row="' + sig.row + '"]') || section.querySelector('[data-row="' + sig.row + '"]');
+        if (!scope) return;
+      }
+      target = scope.querySelector(sel);
+    }
+    if (!target) return;
+    target.focus();
+    try { if (sig.selStart !== null && target.setSelectionRange) target.setSelectionRange(sig.selStart, sig.selEnd); } catch (e) { /* ignore */ }
+  }
   function renderAll() {
+    var focus = captureFocus();
     document.getElementById("dateBanner").innerHTML =
       '<span>' + esc(formatBanner(App.date)) + '</span><span class="date-banner__sub">Logistics team handover</span>';
     renderWrap();
@@ -521,6 +753,7 @@
     renderPackagingPlan();
     renderSafetyChecks();
     renderRosterForecast();
+    restoreFocus(focus);
   }
 
   /* ---------------------------------------------------------
@@ -1182,10 +1415,12 @@
       setTimeout(function () { syncNowBtn.classList.remove("is-spinning"); }, 650);
       pullFromCloud(false);
     });
-    document.addEventListener("visibilitychange", function () { if (!document.hidden && !App.dirty && cloudReady()) pullFromCloud(true); });
-    window.addEventListener("focus", function () { if (!App.dirty && cloudReady()) pullFromCloud(true); });
+    // Coming back to the tab (or clicking into the window) triggers a check.
+    // The two events often fire together; pullFromCloud ignores the repeat.
+    document.addEventListener("visibilitychange", function () { if (!document.hidden && !App.dirty && !cloudOff()) pullFromCloud(true); });
+    window.addEventListener("focus", function () { if (!App.dirty && !cloudOff()) pullFromCloud(true); });
 
-    // Discover whether the Worker has JSONBin sync configured, then adapt
+    // Discover whether the Worker has cloud storage attached, then adapt
     // the UI accordingly — cloudState is unknown until this first call
     // resolves.
     //
@@ -1206,7 +1441,14 @@
         syncNowBtn.style.display = "none";
         setSyncStatus("saved");
       } else {
-        App.pollTimer = setInterval(function () { if (!App.dirty && cloudReady()) pullFromCloud(true); }, Math.max(8, cloudCfg.pollSeconds || 20) * 1000);
+        if (cloudState === "unknown") {
+          // The very first read failed for a reason other than "not set up".
+          // Say so (the pill's hover text explains) — polling below keeps trying.
+          setSyncStatus("error", { detail: "Couldn't reach the sync service just now \u2014 will keep retrying." });
+        }
+        // Check every 45 seconds, but only while the tab is actually visible:
+        // tabs left open all night used to burn through the request allowance.
+        App.pollTimer = setInterval(function () { if (!App.dirty && !document.hidden && !cloudOff()) pullFromCloud(true); }, Math.max(15, cloudCfg.pollSeconds || 45) * 1000);
       }
     });
   }

@@ -1152,6 +1152,12 @@
     if (!d.wrapUp.some(function (t) { return t && t.trim(); })) html += '<tr>' + td("—") + '</tr>';
     html += '</table>';
 
+    // Lock ups (directly after the wrap up)
+    html += '<table style="border-collapse:collapse;width:100%;max-width:900px;margin-top:14px;">';
+    html += '<tr>' + th("Logistics lock up", "width:50%") + th("CR1 lock up") + '</tr>';
+    html += '<tr>' + td(esc(d.lockups.logistics) || "—", "font-weight:bold;") + td(esc(d.lockups.cr1) || "—", "font-weight:bold;") + '</tr>';
+    html += '</table>';
+
     // AM Priorities
     html += '<div style="text-align:left;font-family:Arial,Helvetica,sans-serif;font-weight:bold;font-size:16px;color:' + C.ink + ';margin:22px 0 2px;">' + esc(formatBanner(addDays(d.date, 1))) + '</div>';
     html += sectionTitle("AM Priorities", C.mint);
@@ -1166,11 +1172,6 @@
       if (!t.text && !t.assignee) return;
       html += '<tr>' + td(esc(t.text) || "—") + td(esc(t.assignee) || "—", "font-weight:bold;") + '</tr>';
     });
-    html += '</table>';
-
-    html += '<table style="border-collapse:collapse;width:100%;max-width:900px;margin-top:14px;">';
-    html += '<tr>' + th("Logistics lock up", "width:50%") + th("CR1 lock up") + '</tr>';
-    html += '<tr>' + td(esc(d.lockups.logistics) || "—", "font-weight:bold;") + td(esc(d.lockups.cr1) || "—", "font-weight:bold;") + '</tr>';
     html += '</table>';
 
     // Outbounds / inbounds
@@ -1253,11 +1254,11 @@
     lines.push("");
     lines.push("TODAY'S WRAP UP");
     d.wrapUp.filter(function (t) { return t && t.trim(); }).forEach(function (t) { lines.push("  - " + t); });
+    lines.push("  Logistics lock up: " + (d.lockups.logistics || "–"));
+    lines.push("  CR1 lock up: " + (d.lockups.cr1 || "–"));
     lines.push("");
     lines.push("AM PRIORITIES — " + formatBanner(addDays(d.date, 1)));
     d.amPriorities.filter(function (t) { return t && t.trim(); }).forEach(function (t) { lines.push("  - " + t); });
-    lines.push("  Logistics lock up: " + (d.lockups.logistics || "–"));
-    lines.push("  CR1 lock up: " + (d.lockups.cr1 || "–"));
     lines.push("");
     lines.push("ADDITIONAL TASKS");
     d.additionalTasks.forEach(function (t) { if (!t.text && !t.assignee) return; lines.push("  " + (t.text || "–") + " — " + (t.assignee || "Unassigned")); });
